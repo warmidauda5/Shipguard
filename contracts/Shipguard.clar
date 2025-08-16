@@ -12,10 +12,20 @@
 (define-constant ERR_MILESTONE_ALREADY_COMPLETED (err u110))
 (define-constant ERR_MILESTONE_ORDER_VIOLATION (err u111))
 (define-constant ERR_MILESTONE_NOT_FOUND (err u112))
+(define-constant ERR_ESCROW_NOT_FOUND (err u113))
+(define-constant ERR_ESCROW_ALREADY_EXISTS (err u114))
+(define-constant ERR_ESCROW_ALREADY_RELEASED (err u115))
+(define-constant ERR_INVALID_RELEASE_AMOUNT (err u116))
+(define-constant ERR_NOT_ESCROW_PARTY (err u117))
+(define-constant ERR_DISPUTE_ACTIVE (err u118))
+(define-constant ERR_DISPUTE_NOT_FOUND (err u119))
+(define-constant ERR_INVALID_VOTE (err u120))
 
 (define-data-var next-shipment-id uint u1)
 (define-data-var oracle-address principal CONTRACT_OWNER)
 (define-data-var base-premium-rate uint u100)
+(define-data-var next-escrow-id uint u1)
+(define-data-var dispute-resolution-period uint u1440)
 
 (define-map shipments
   { shipment-id: uint }
@@ -61,6 +71,45 @@
     is-critical: bool,
     max-delay-blocks: uint
   }
+)
+
+(define-map escrow-accounts
+  { escrow-id: uint }
+  {
+    shipment-id: uint,
+    payer: principal,
+    payee: principal,
+    amount: uint,
+    released-amount: uint,
+    created-at: uint,
+    release-deadline: uint,
+    status: (string-ascii 20),
+    payer-approved: bool,
+    payee-approved: bool,
+    oracle-approved: bool,
+    dispute-active: bool
+  }
+)
+
+(define-map escrow-disputes
+  { escrow-id: uint }
+  {
+    initiated-by: principal,
+    initiated-at: uint,
+    reason: (string-ascii 200),
+    evidence-hash: (optional (string-ascii 64)),
+    resolution-deadline: uint,
+    resolved: bool,
+    resolution: (optional (string-ascii 100)),
+    votes-for-payer: uint,
+    votes-for-payee: uint,
+    total-votes: uint
+  }
+)
+
+(define-map dispute-votes
+  { escrow-id: uint, voter: principal }
+  { vote: (string-ascii 10), voted-at: uint }
 )
 
 (define-public (create-shipment (recipient principal) (expected-delivery uint) (insurance-amount uint))
@@ -534,3 +583,286 @@
     (ok true)
   )
 )
+
+(define-public (create-escrow (shipment-id uint) (payee principal) (amount uint) (release-deadline uint))
+  (let
+    (
+      (escrow-id (var-get next-escrow-id))
+      (current-height stacks-block-height)
+      (shipment (unwrap! (map-get? shipments { shipment-id: shipment-id }) ERR_SHIPMENT_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get shipper shipment)) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_RELEASE_AMOUNT)
+    (asserts! (> release-deadline current-height) ERR_INVALID_STATUS)
+    (asserts! (is-none (map-get? escrow-accounts { escrow-id: escrow-id })) ERR_ESCROW_ALREADY_EXISTS)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set escrow-accounts
+      { escrow-id: escrow-id }
+      {
+        shipment-id: shipment-id,
+        payer: tx-sender,
+        payee: payee,
+        amount: amount,
+        released-amount: u0,
+        created-at: current-height,
+        release-deadline: release-deadline,
+        status: "active",
+        payer-approved: false,
+        payee-approved: false,
+        oracle-approved: false,
+        dispute-active: false
+      }
+    )
+    
+    (var-set next-escrow-id (+ escrow-id u1))
+    (ok escrow-id)
+  )
+)
+
+(define-public (approve-escrow-release (escrow-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? escrow-accounts { escrow-id: escrow-id }) ERR_ESCROW_NOT_FOUND))
+      (current-height stacks-block-height)
+    )
+    (asserts! (not (get dispute-active escrow)) ERR_DISPUTE_ACTIVE)
+    (asserts! (< current-height (get release-deadline escrow)) ERR_INVALID_STATUS)
+    (asserts! (is-eq (get status escrow) "active") ERR_ESCROW_ALREADY_RELEASED)
+    
+    (let
+      (
+        (updated-escrow
+          (if (is-eq tx-sender (get payer escrow))
+            (merge escrow { payer-approved: true })
+            (if (is-eq tx-sender (get payee escrow))
+              (merge escrow { payee-approved: true })
+              (if (is-eq tx-sender (var-get oracle-address))
+                (merge escrow { oracle-approved: true })
+                escrow
+              )
+            )
+          )
+        )
+      )
+      (asserts! (or (is-eq tx-sender (get payer escrow)) (is-eq tx-sender (get payee escrow)) (is-eq tx-sender (var-get oracle-address))) ERR_NOT_ESCROW_PARTY)
+      
+      (map-set escrow-accounts { escrow-id: escrow-id } updated-escrow)
+      
+      (let
+        (
+          (approval-count (+ (if (get payer-approved updated-escrow) u1 u0) (+ (if (get payee-approved updated-escrow) u1 u0) (if (get oracle-approved updated-escrow) u1 u0))))
+        )
+        (if (>= approval-count u2)
+          (execute-escrow-release escrow-id)
+          (ok true)
+        )
+      )
+    )
+  )
+)
+
+(define-public (release-escrow-partial (escrow-id uint) (release-amount uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? escrow-accounts { escrow-id: escrow-id }) ERR_ESCROW_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (var-get oracle-address)) ERR_UNAUTHORIZED)
+    (asserts! (not (get dispute-active escrow)) ERR_DISPUTE_ACTIVE)
+    (asserts! (is-eq (get status escrow) "active") ERR_ESCROW_ALREADY_RELEASED)
+    (asserts! (<= release-amount (- (get amount escrow) (get released-amount escrow))) ERR_INVALID_RELEASE_AMOUNT)
+    
+    (try! (as-contract (stx-transfer? release-amount tx-sender (get payee escrow))))
+    
+    (let
+      (
+        (new-released-amount (+ (get released-amount escrow) release-amount))
+        (new-status (if (is-eq new-released-amount (get amount escrow)) "completed" "active"))
+      )
+      (map-set escrow-accounts
+        { escrow-id: escrow-id }
+        (merge escrow { 
+          released-amount: new-released-amount,
+          status: new-status
+        })
+      )
+    )
+    
+    (ok release-amount)
+  )
+)
+
+(define-public (initiate-escrow-dispute (escrow-id uint) (reason (string-ascii 200)) (evidence-hash (optional (string-ascii 64))))
+  (let
+    (
+      (escrow (unwrap! (map-get? escrow-accounts { escrow-id: escrow-id }) ERR_ESCROW_NOT_FOUND))
+      (current-height stacks-block-height)
+    )
+    (asserts! (or (is-eq tx-sender (get payer escrow)) (is-eq tx-sender (get payee escrow))) ERR_NOT_ESCROW_PARTY)
+    (asserts! (not (get dispute-active escrow)) ERR_DISPUTE_ACTIVE)
+    (asserts! (is-eq (get status escrow) "active") ERR_ESCROW_ALREADY_RELEASED)
+    
+    (map-set escrow-disputes
+      { escrow-id: escrow-id }
+      {
+        initiated-by: tx-sender,
+        initiated-at: current-height,
+        reason: reason,
+        evidence-hash: evidence-hash,
+        resolution-deadline: (+ current-height (var-get dispute-resolution-period)),
+        resolved: false,
+        resolution: none,
+        votes-for-payer: u0,
+        votes-for-payee: u0,
+        total-votes: u0
+      }
+    )
+    
+    (map-set escrow-accounts
+      { escrow-id: escrow-id }
+      (merge escrow { dispute-active: true })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (vote-on-dispute (escrow-id uint) (vote (string-ascii 10)))
+  (let
+    (
+      (dispute (unwrap! (map-get? escrow-disputes { escrow-id: escrow-id }) ERR_DISPUTE_NOT_FOUND))
+      (current-height stacks-block-height)
+      (existing-vote (map-get? dispute-votes { escrow-id: escrow-id, voter: tx-sender }))
+    )
+    (asserts! (not (get resolved dispute)) ERR_DISPUTE_NOT_FOUND)
+    (asserts! (< current-height (get resolution-deadline dispute)) ERR_INVALID_STATUS)
+    (asserts! (or (is-eq vote "payer") (is-eq vote "payee")) ERR_INVALID_VOTE)
+    (asserts! (is-none existing-vote) ERR_INVALID_VOTE)
+    
+    (map-set dispute-votes
+      { escrow-id: escrow-id, voter: tx-sender }
+      { vote: vote, voted-at: current-height }
+    )
+    
+    (let
+      (
+        (new-votes-for-payer (if (is-eq vote "payer") (+ (get votes-for-payer dispute) u1) (get votes-for-payer dispute)))
+        (new-votes-for-payee (if (is-eq vote "payee") (+ (get votes-for-payee dispute) u1) (get votes-for-payee dispute)))
+        (new-total-votes (+ (get total-votes dispute) u1))
+      )
+      (map-set escrow-disputes
+        { escrow-id: escrow-id }
+        (merge dispute {
+          votes-for-payer: new-votes-for-payer,
+          votes-for-payee: new-votes-for-payee,
+          total-votes: new-total-votes
+        })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (resolve-dispute (escrow-id uint))
+  (let
+    (
+      (dispute (unwrap! (map-get? escrow-disputes { escrow-id: escrow-id }) ERR_DISPUTE_NOT_FOUND))
+      (escrow (unwrap! (map-get? escrow-accounts { escrow-id: escrow-id }) ERR_ESCROW_NOT_FOUND))
+      (current-height stacks-block-height)
+    )
+    (asserts! (or (>= current-height (get resolution-deadline dispute)) (is-eq tx-sender (var-get oracle-address))) ERR_UNAUTHORIZED)
+    (asserts! (not (get resolved dispute)) ERR_DISPUTE_NOT_FOUND)
+    (asserts! (get dispute-active escrow) ERR_DISPUTE_NOT_FOUND)
+    
+    (let
+      (
+        (payer-votes (get votes-for-payer dispute))
+        (payee-votes (get votes-for-payee dispute))
+        (winner (if (> payer-votes payee-votes) "payer" "payee"))
+        (refund-to (if (is-eq winner "payer") (get payer escrow) (get payee escrow)))
+        (remaining-amount (- (get amount escrow) (get released-amount escrow)))
+      )
+      (try! (as-contract (stx-transfer? remaining-amount tx-sender refund-to)))
+      
+      (map-set escrow-disputes
+        { escrow-id: escrow-id }
+        (merge dispute {
+          resolved: true,
+          resolution: (some (if (is-eq winner "payer") "refunded-to-payer" "released-to-payee"))
+        })
+      )
+      
+      (map-set escrow-accounts
+        { escrow-id: escrow-id }
+        (merge escrow {
+          status: "disputed-resolved",
+          dispute-active: false,
+          released-amount: (get amount escrow)
+        })
+      )
+      
+      (ok winner)
+    )
+  )
+)
+
+(define-read-only (get-escrow (escrow-id uint))
+  (map-get? escrow-accounts { escrow-id: escrow-id })
+)
+
+(define-read-only (get-escrow-dispute (escrow-id uint))
+  (map-get? escrow-disputes { escrow-id: escrow-id })
+)
+
+(define-read-only (get-dispute-vote (escrow-id uint) (voter principal))
+  (map-get? dispute-votes { escrow-id: escrow-id, voter: voter })
+)
+
+(define-read-only (calculate-escrow-status (escrow-id uint))
+  (let
+    (
+      (escrow (map-get? escrow-accounts { escrow-id: escrow-id }))
+      (current-height stacks-block-height)
+    )
+    (match escrow
+      account (let
+        (
+          (is-expired (> current-height (get release-deadline account)))
+          (is-fully-released (is-eq (get released-amount account) (get amount account)))
+          (approval-count (+ (if (get payer-approved account) u1 u0) (+ (if (get payee-approved account) u1 u0) (if (get oracle-approved account) u1 u0))))
+        )
+        (ok {
+          status: (get status account),
+          is-expired: is-expired,
+          is-fully-released: is-fully-released,
+          approval-count: approval-count,
+          ready-for-release: (and (>= approval-count u2) (not (get dispute-active account)))
+        })
+      )
+      (err ERR_ESCROW_NOT_FOUND)
+    )
+  )
+)
+
+(define-private (execute-escrow-release (escrow-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? escrow-accounts { escrow-id: escrow-id }) ERR_ESCROW_NOT_FOUND))
+      (remaining-amount (- (get amount escrow) (get released-amount escrow)))
+    )
+    (try! (as-contract (stx-transfer? remaining-amount tx-sender (get payee escrow))))
+    
+    (map-set escrow-accounts
+      { escrow-id: escrow-id }
+      (merge escrow { 
+        released-amount: (get amount escrow),
+        status: "completed"
+      })
+    )
+    
+    (ok true)
+  )
+)
+
