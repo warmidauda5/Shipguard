@@ -9,6 +9,14 @@ requirements = []
 path = 'contracts/Shipguard.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.ShipmentRatings]
+path = 'contracts/ShipmentRatings.clar'
+clarity_version = 3
+epoch = 3.1
+[contracts.carbon-tracker]
+path = 'contracts/carbon-tracker.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
